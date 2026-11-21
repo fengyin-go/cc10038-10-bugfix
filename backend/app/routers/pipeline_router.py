@@ -26,6 +26,28 @@ class IngestBatchPayload(BaseModel):
 class ParseBatchPayload(BaseModel):
     batch_no: str = Field(..., min_length=1)
     parser_rule_name: str | None = None
+    # False 时若批次已有解析在运行，立即返回运行中冲突回执，不进入下游
+    wait: bool = True
+    operator: str | None = None
+
+
+class PublishRulePayload(BaseModel):
+    rule_name: str = Field(..., min_length=1)
+    data_source: str = Field(..., min_length=1)
+    input_format: str = "pipe"
+    output_fields: list[str] = Field(default_factory=lambda: ["time", "level", "message"])
+    engine: str = "regex"
+    version: str = ""
+
+
+class ParseDelayPayload(BaseModel):
+    batch_no: str = Field(..., min_length=1)
+    seconds: float = Field(..., ge=0)
+
+
+class InjectDuplicatePayload(BaseModel):
+    batch_no: str = Field(..., min_length=1)
+    rule_version_key: str = Field(..., min_length=1)
 
 
 class DedupPayload(BaseModel):
@@ -87,9 +109,69 @@ def pipeline_start_batch(payload: IngestBatchPayload) -> dict[str, Any]:
     return pipeline.start_ingest_batch(payload.source_id, payload.time_window, payload.raw_logs)
 
 
+@router.post("/rule/publish")
+def pipeline_publish_rule(payload: PublishRulePayload) -> dict[str, Any]:
+    return pipeline.publish_parser_rule(
+        payload.rule_name,
+        payload.data_source,
+        payload.input_format,
+        payload.output_fields,
+        payload.engine,
+        payload.version,
+    )
+
+
 @router.post("/batch/parse")
 def pipeline_parse_batch(payload: ParseBatchPayload) -> dict[str, Any]:
-    return pipeline.parse_batch(payload.batch_no, payload.parser_rule_name)
+    return pipeline.parse_batch(
+        payload.batch_no,
+        payload.parser_rule_name,
+        wait=payload.wait,
+        operator=payload.operator,
+    )
+
+
+@router.get("/batch/parse-status")
+def pipeline_parse_status(batch_no: str = Query(..., min_length=1)) -> dict[str, Any]:
+    """查询批次解析尝试：区分已确认回执与仍在运行的尝试。"""
+    return pipeline.get_parse_status(batch_no)
+
+
+@router.post("/test/parse-delay")
+def pipeline_set_parse_delay(payload: ParseDelayPayload) -> dict[str, Any]:
+    """测试/演练用途：设置批次解析临界区延迟，复现并发提交窗口。"""
+    pipeline.set_parse_delay(payload.batch_no, payload.seconds)
+    return {"ok": True, "message": f"批次 {payload.batch_no} 解析延迟已设为 {payload.seconds}s"}
+
+
+@router.post("/test/inject-duplicates")
+def pipeline_inject_duplicates(payload: InjectDuplicatePayload) -> dict[str, Any]:
+    """测试/演练用途：注入修复前形态的重复明细，验证清理与统计口径。"""
+    return pipeline.inject_legacy_duplicates(payload.batch_no, payload.rule_version_key)
+
+
+@router.get("/usage/stats")
+def pipeline_usage_stats(batch_no: str | None = Query(default=None)) -> dict[str, Any]:
+    """基于唯一血缘的明细用量统计。"""
+    return pipeline.get_usage_stats(batch_no)
+
+
+@router.get("/lineage/{lineage_id}/trace")
+def pipeline_trace_lineage(lineage_id: int) -> dict[str, Any]:
+    """从血缘逐行展开标准化明细及原始正文，核查重复数据残留。"""
+    return pipeline.trace_lineage(lineage_id)
+
+
+@router.get("/entity/{entity_id}/trace")
+def pipeline_trace_entity(entity_id: int) -> dict[str, Any]:
+    """从标准化明细逐行回查原始记录、血缘与同原始行的其他版本明细。"""
+    return pipeline.trace_entity(entity_id)
+
+
+@router.post("/cleanup/duplicates")
+def pipeline_cleanup_duplicates(batch_no: str | None = Query(default=None)) -> dict[str, Any]:
+    """清理历史重复写入残留，保留最早明细，其余标记为重复残留。"""
+    return pipeline.cleanup_duplicate_entities(batch_no)
 
 
 @router.post("/batch/recover")
